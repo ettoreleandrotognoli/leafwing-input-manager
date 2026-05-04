@@ -88,8 +88,36 @@ pub use action_data::*;
 pub struct ActionState<A: Actionlike> {
     /// Whether or not all of the actions are disabled.
     disabled: bool,
+    /// How button transitions should behave across context activation boundaries.
+    #[serde(default)]
+    input_context_policy: InputContextPolicy,
     /// The shared action data for each action
     action_data: HashMap<A, ActionData>,
+    /// Tracks freshness information for button-like actions after the action state was marked fresh.
+    #[serde(default)]
+    button_context: HashMap<A, ButtonContext>,
+}
+
+/// Configures how button transitions should behave across context activation boundaries.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Reflect)]
+pub enum InputContextPolicy {
+    /// Preserve the legacy behavior for `just_pressed` and `just_released`.
+    #[default]
+    Legacy,
+    /// Ignore stale releases from inputs that were already in progress when the action state
+    /// was marked fresh.
+    IgnoreStaleReleases,
+    /// Only report `just_pressed` and `just_released` for input cycles that began after the
+    /// action state was marked fresh.
+    RequireFreshPressCycle,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Reflect)]
+struct ButtonContext {
+    /// Was the button already held when the action state was last marked fresh?
+    pressed_at_fresh: bool,
+    /// Has this button started a fresh press cycle since the action state was marked fresh?
+    fresh_press_seen: bool,
 }
 
 // The derive does not work unless A: Default,
@@ -98,7 +126,9 @@ impl<A: Actionlike> Default for ActionState<A> {
     fn default() -> Self {
         Self {
             disabled: false,
+            input_context_policy: InputContextPolicy::default(),
             action_data: HashMap::default(),
+            button_context: HashMap::default(),
         }
     }
 }
@@ -109,6 +139,113 @@ impl<A: Actionlike> ActionState<A> {
     #[must_use]
     pub fn all_action_data(&self) -> &HashMap<A, ActionData> {
         &self.action_data
+    }
+
+    /// Configures how button transitions should behave across context activation boundaries.
+    #[inline]
+    #[must_use]
+    pub fn with_input_context_policy(mut self, policy: InputContextPolicy) -> Self {
+        self.set_input_context_policy(policy);
+        self
+    }
+
+    /// Returns the current button transition behavior across context activation boundaries.
+    #[inline]
+    #[must_use]
+    pub fn input_context_policy(&self) -> InputContextPolicy {
+        self.input_context_policy
+    }
+
+    /// Configures how button transitions should behave across context activation boundaries.
+    #[inline]
+    pub fn set_input_context_policy(&mut self, policy: InputContextPolicy) {
+        self.input_context_policy = policy;
+    }
+
+    /// Marks the entire [`ActionState`] as fresh.
+    ///
+    /// This snapshots which known button-like actions are currently held.
+    /// After calling this, stale button transitions can be filtered according to
+    /// [`InputContextPolicy`].
+    #[inline]
+    pub fn mark_as_fresh(&mut self) {
+        self.button_context.clear();
+
+        for (action, action_data) in self.action_data.iter() {
+            let ActionKindData::Button(button_data) = &action_data.kind_data else {
+                continue;
+            };
+
+            if button_data.pressed() {
+                self.button_context.insert(
+                    action.clone(),
+                    ButtonContext {
+                        pressed_at_fresh: true,
+                        fresh_press_seen: false,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Marks a single `action` as fresh.
+    ///
+    /// This is useful when you only want to ignore stale releases for one button-like action.
+    #[inline]
+    #[track_caller]
+    pub fn mark_action_as_fresh(&mut self, action: &A) {
+        debug_assert_eq!(action.input_control_kind(), InputControlKind::Button);
+
+        if self.pressed(action) {
+            self.button_context.insert(
+                action.clone(),
+                ButtonContext {
+                    pressed_at_fresh: true,
+                    fresh_press_seen: false,
+                },
+            );
+        } else {
+            self.button_context.remove(action);
+        }
+    }
+
+    /// Returns whether `action` has been pressed since it was last marked fresh.
+    #[inline]
+    #[must_use]
+    pub fn pressed_since_fresh(&self, action: &A) -> bool {
+        self.button_context
+            .get(action)
+            .is_some_and(|context| context.fresh_press_seen)
+    }
+
+    #[inline]
+    fn note_button_press(&mut self, action: &A, started_press_cycle: bool) {
+        if !started_press_cycle {
+            return;
+        }
+
+        self.button_context.insert(
+            action.clone(),
+            ButtonContext {
+                pressed_at_fresh: false,
+                fresh_press_seen: true,
+            },
+        );
+    }
+
+    #[inline]
+    fn note_button_release(&mut self, action: &A) {
+        let should_remove = match self.button_context.get_mut(action) {
+            Some(context) => {
+                context.pressed_at_fresh = false;
+                !context.fresh_press_seen
+            }
+            None => false,
+        };
+
+        if should_remove {
+            self.button_context.remove(action);
+        }
     }
 
     /// We are about to enter the `Main` schedule, so we:
@@ -607,24 +744,32 @@ impl<A: Actionlike> ActionState<A> {
         debug_assert_eq!(action.input_control_kind(), InputControlKind::Button);
         const BUTTON_PRESS_THRESHOLD: f32 = 0.02;
 
-        let button_data = self.button_data_mut_or_default(action);
-        button_data.value = value;
+        let started_press_cycle = {
+            let button_data = self.button_data_mut_or_default(action);
+            button_data.value = value;
 
-        if value > BUTTON_PRESS_THRESHOLD {
-            #[cfg(feature = "timing")]
-            if button_data.state.released() {
-                button_data.timing.flip();
+            if value > BUTTON_PRESS_THRESHOLD {
+                let started_press_cycle = button_data.state.released();
+
+                #[cfg(feature = "timing")]
+                if started_press_cycle {
+                    button_data.timing.flip();
+                }
+
+                button_data.state.press();
+                started_press_cycle
+            } else {
+                #[cfg(feature = "timing")]
+                if button_data.state.pressed() {
+                    button_data.timing.flip();
+                }
+
+                button_data.state.release();
+                false
             }
+        };
 
-            button_data.state.press();
-        } else {
-            #[cfg(feature = "timing")]
-            if button_data.state.pressed() {
-                button_data.timing.flip();
-            }
-
-            button_data.state.release();
-        }
+        self.note_button_press(action, started_press_cycle);
     }
 
     /// Get the value associated with the corresponding `action`, clamped to `[0.0, 1.0]`.
@@ -816,6 +961,18 @@ impl<A: Actionlike> ActionState<A> {
     pub fn set_button_data(&mut self, action: A, data: ButtonData) {
         debug_assert_eq!(action.input_control_kind(), InputControlKind::Button);
 
+        if data.state == crate::buttonlike::ButtonState::Released {
+            self.button_context.remove(&action);
+        } else {
+            self.button_context.insert(
+                action.clone(),
+                ButtonContext {
+                    pressed_at_fresh: false,
+                    fresh_press_seen: true,
+                },
+            );
+        }
+
         let button_data = self.button_data_mut_or_default(&action);
         *button_data = data;
     }
@@ -829,15 +986,21 @@ impl<A: Actionlike> ActionState<A> {
     pub fn press(&mut self, action: &A) {
         debug_assert_eq!(action.input_control_kind(), InputControlKind::Button);
 
-        let action_data = self.button_data_mut_or_default(action);
+        let started_press_cycle = {
+            let action_data = self.button_data_mut_or_default(action);
+            let started_press_cycle = action_data.state.released();
 
-        #[cfg(feature = "timing")]
-        if action_data.update_state.released() {
-            action_data.timing.flip();
-        }
+            #[cfg(feature = "timing")]
+            if action_data.update_state.released() {
+                action_data.timing.flip();
+            }
 
-        action_data.state.press();
-        action_data.value = 1.0;
+            action_data.state.press();
+            action_data.value = 1.0;
+            started_press_cycle
+        };
+
+        self.note_button_press(action, started_press_cycle);
     }
 
     /// Release the `action`
@@ -857,6 +1020,8 @@ impl<A: Actionlike> ActionState<A> {
 
         action_data.state.release();
         action_data.value = 0.0;
+
+        self.note_button_release(action);
     }
 
     /// Resets an action to its default state.
@@ -997,7 +1162,17 @@ impl<A: Actionlike> ActionState<A> {
         }
 
         match self.button_data(action) {
-            Some(button_data) => button_data.just_pressed(),
+            Some(button_data) => {
+                let just_pressed = button_data.just_pressed();
+                if !just_pressed {
+                    return false;
+                }
+
+                match self.input_context_policy {
+                    InputContextPolicy::Legacy | InputContextPolicy::IgnoreStaleReleases => true,
+                    InputContextPolicy::RequireFreshPressCycle => self.pressed_since_fresh(action),
+                }
+            }
             None => false,
         }
     }
@@ -1043,7 +1218,20 @@ impl<A: Actionlike> ActionState<A> {
         }
 
         match self.button_data(action) {
-            Some(button_data) => button_data.just_released(),
+            Some(button_data) => {
+                let just_released = button_data.just_released();
+                if !just_released {
+                    return false;
+                }
+
+                match self.input_context_policy {
+                    InputContextPolicy::Legacy => true,
+                    InputContextPolicy::IgnoreStaleReleases
+                    | InputContextPolicy::RequireFreshPressCycle => {
+                        self.pressed_since_fresh(action)
+                    }
+                }
+            }
             None => false,
         }
     }
@@ -1187,6 +1375,7 @@ mod tests {
     use crate::action_diff::ActionDiff;
     use crate::action_state::{
         ActionData, ActionKindData, ActionState, AxisData, ButtonData, DualAxisData,
+        InputContextPolicy,
     };
     use crate::buttonlike::{ButtonState, ButtonValue};
     use crate::input_map::UpdatedActions;
@@ -1197,6 +1386,7 @@ mod tests {
     #[cfg(feature = "keyboard")]
     use bevy::input::keyboard::KeyCode;
     use bevy::platform::collections::HashMap;
+    use bevy::platform::time::Instant;
     use bevy::prelude::*;
     use leafwing_input_manager_macros::Actionlike;
 
@@ -2178,6 +2368,70 @@ mod tests {
         let just_released_actions: Vec<TestAction> = action_state.get_just_released();
         assert_eq!(just_released_actions.len(), 1);
         assert!(just_released_actions.contains(&TestAction::Run));
+    }
+
+    #[test]
+    fn test_mark_as_fresh_does_not_change_legacy_just_released_behavior() {
+        let mut action_state = ActionState::<TestAction>::default();
+        action_state.press(&TestAction::Run);
+        action_state.tick(Instant::now(), Instant::now());
+        action_state.mark_as_fresh();
+        action_state.press(&TestAction::Run);
+        action_state.release(&TestAction::Run);
+
+        assert!(action_state.just_released(&TestAction::Run));
+    }
+
+    #[test]
+    fn test_just_pressed_can_require_a_fresh_press_cycle() {
+        let mut action_state = ActionState::<TestAction>::default()
+            .with_input_context_policy(InputContextPolicy::RequireFreshPressCycle);
+
+        action_state.press(&TestAction::Run);
+        assert!(action_state.pressed(&TestAction::Run));
+        assert!(action_state.just_pressed(&TestAction::Run));
+
+        action_state.mark_as_fresh();
+
+        assert!(action_state.pressed(&TestAction::Run));
+        assert!(!action_state.pressed_since_fresh(&TestAction::Run));
+        assert!(!action_state.just_pressed(&TestAction::Run));
+
+        action_state.tick(Instant::now(), Instant::now());
+        action_state.release(&TestAction::Run);
+
+        assert!(!action_state.just_released(&TestAction::Run));
+
+        action_state.tick(Instant::now(), Instant::now());
+        action_state.press(&TestAction::Run);
+
+        assert!(action_state.pressed_since_fresh(&TestAction::Run));
+        assert!(action_state.just_pressed(&TestAction::Run));
+    }
+
+    #[test]
+    fn test_just_released_can_require_a_fresh_press() {
+        let mut action_state = ActionState::<TestAction>::default()
+            .with_input_context_policy(InputContextPolicy::IgnoreStaleReleases);
+
+        action_state.press(&TestAction::Run);
+        action_state.tick(Instant::now(), Instant::now());
+        action_state.mark_as_fresh();
+
+        assert!(!action_state.pressed_since_fresh(&TestAction::Run));
+
+        // Simulate an action that is still held after the state became fresh.
+        action_state.press(&TestAction::Run);
+        action_state.release(&TestAction::Run);
+
+        assert!(!action_state.just_released(&TestAction::Run));
+
+        action_state.tick(Instant::now(), Instant::now());
+        action_state.press(&TestAction::Run);
+        assert!(action_state.pressed_since_fresh(&TestAction::Run));
+        action_state.release(&TestAction::Run);
+
+        assert!(action_state.just_released(&TestAction::Run));
     }
 
     #[cfg(feature = "gamepad")]

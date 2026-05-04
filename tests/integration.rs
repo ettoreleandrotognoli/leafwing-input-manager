@@ -8,6 +8,11 @@ enum Action {
     PayRespects,
 }
 
+#[derive(Actionlike, Clone, Copy, Debug, Reflect, PartialEq, Eq, Hash)]
+enum PolicyAction {
+    Confirm,
+}
+
 // A resource that represents whether respects have been paid or not
 #[derive(Resource, Default, PartialEq, Debug)]
 struct Respect(bool);
@@ -52,6 +57,16 @@ fn spawn_player(mut commands: Commands) {
     commands
         .spawn(InputMap::new([(Action::PayRespects, KeyCode::KeyF)]))
         .insert(Player);
+}
+
+fn spawn_policy_player(mut commands: Commands) {
+    commands
+        .spawn(InputMap::new([(PolicyAction::Confirm, KeyCode::Space)]))
+        .insert(Player);
+}
+
+fn spawn_empty_policy_player(mut commands: Commands) {
+    commands.spawn(Player);
 }
 
 #[test]
@@ -158,6 +173,88 @@ fn release_when_input_map_removed() {
     app.update();
     let respect = app.world().resource::<Respect>();
     assert_eq!(*respect, Respect(false));
+}
+
+#[test]
+fn plugin_default_input_context_policy_is_applied_to_resources_and_components() {
+    use bevy::input::InputPlugin;
+
+    let mut app = App::new();
+
+    app.add_plugins(MinimalPlugins)
+        .add_plugins(InputPlugin)
+        .add_plugins(
+            InputManagerPlugin::<PolicyAction>::default()
+                .with_input_context_policy(InputContextPolicy::IgnoreStaleReleases),
+        )
+        .add_systems(Startup, spawn_policy_player);
+
+    app.update();
+
+    app.world_mut().spawn(InputMap::<PolicyAction>::new([(
+        PolicyAction::Confirm,
+        KeyCode::Space,
+    )]));
+
+
+    let action_state = app
+        .world_mut()
+        .query_filtered::<&ActionState<PolicyAction>, With<Player>>()
+        .single(app.world())
+        .expect("ActionState not found");
+    assert_eq!(
+        action_state.input_context_policy(),
+        InputContextPolicy::IgnoreStaleReleases
+    );
+}
+
+#[test]
+fn reinserting_input_map_marks_action_state_fresh_for_non_legacy_policies() {
+    use bevy::input::InputPlugin;
+
+    let mut app = App::new();
+
+    app.add_plugins(MinimalPlugins)
+        .add_plugins(InputPlugin)
+        .add_plugins(
+            InputManagerPlugin::<PolicyAction>::default()
+                .with_input_context_policy(InputContextPolicy::IgnoreStaleReleases),
+        )
+        .add_systems(Startup, spawn_empty_policy_player);
+
+    app.update();
+
+    let player = app
+        .world_mut()
+        .query_filtered::<Entity, With<Player>>()
+        .single(app.world())
+        .expect("Player not found");
+
+    KeyCode::Space.press(app.world_mut());
+    app.update();
+
+    app.world_mut()
+        .entity_mut(player)
+        .insert(InputMap::new([(PolicyAction::Confirm, KeyCode::Space)]));
+    app.update();
+
+    let action_state = app
+        .world_mut()
+        .query_filtered::<&ActionState<PolicyAction>, With<Player>>()
+        .single(app.world())
+        .expect("ActionState not found");
+    assert!(action_state.pressed(&PolicyAction::Confirm));
+    assert!(!action_state.pressed_since_fresh(&PolicyAction::Confirm));
+
+    KeyCode::Space.release(app.world_mut());
+    app.update();
+
+    let action_state = app
+        .world_mut()
+        .query_filtered::<&ActionState<PolicyAction>, With<Player>>()
+        .single(app.world())
+        .expect("ActionState not found");
+    assert!(!action_state.just_released(&PolicyAction::Confirm));
 }
 
 #[cfg(feature = "timing")]

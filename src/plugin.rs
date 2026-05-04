@@ -13,7 +13,7 @@ use bevy::reflect::TypePath;
 use updating::CentralInputStore;
 
 use crate::Actionlike;
-use crate::action_state::{ActionState, ButtonData};
+use crate::action_state::{ActionState, ButtonData, InputContextPolicy};
 use crate::clashing_inputs::ClashStrategy;
 use crate::input_map::InputMap;
 use crate::input_processing::*;
@@ -54,6 +54,7 @@ use crate::user_input::*;
 pub struct InputManagerPlugin<A: Actionlike> {
     _phantom: PhantomData<A>,
     machine: Machine,
+    input_context_policy: InputContextPolicy,
 }
 
 // Deriving default induces an undesired bound on the generic
@@ -62,6 +63,7 @@ impl<A: Actionlike> Default for InputManagerPlugin<A> {
         Self {
             _phantom: PhantomData,
             machine: Machine::Client,
+            input_context_policy: InputContextPolicy::Legacy,
         }
     }
 }
@@ -77,7 +79,16 @@ impl<A: Actionlike> InputManagerPlugin<A> {
         Self {
             _phantom: PhantomData,
             machine: Machine::Server,
+            input_context_policy: InputContextPolicy::Legacy,
         }
+    }
+
+    /// Configures the default [`InputContextPolicy`] for [`ActionState<A>`] values managed by
+    /// this plugin.
+    #[must_use]
+    pub fn with_input_context_policy(mut self, policy: InputContextPolicy) -> Self {
+        self.input_context_policy = policy;
+        self
     }
 }
 
@@ -93,6 +104,8 @@ impl<A: Actionlike + TypePath + bevy::reflect::GetTypeRegistration> Plugin
     fn build(&self, app: &mut App) {
         use crate::systems::*;
 
+        app.insert_resource(InputManagerSettings::<A>::new(self.input_context_policy));
+
         match self.machine {
             Machine::Client => {
                 if !app.is_plugin_added::<CentralInputStorePlugin>() {
@@ -103,9 +116,11 @@ impl<A: Actionlike + TypePath + bevy::reflect::GetTypeRegistration> Plugin
                 app.add_systems(
                     PreUpdate,
                     (
+                        apply_action_state_settings::<A>,
                         tick_action_state::<A>.in_set(TickActionStateSystem::<A>::new()),
                         clear_central_input_store,
                     )
+                        .chain()
                         .in_set(InputManagerSystem::Tick)
                         .before(InputManagerSystem::Update),
                 )
@@ -145,6 +160,7 @@ impl<A: Actionlike + TypePath + bevy::reflect::GetTypeRegistration> Plugin
                 app.add_systems(
                     RunFixedMainLoop,
                     (
+                        apply_action_state_settings::<A>,
                         swap_to_fixed_update::<A>,
                         // we want to update the ActionState only once, even if the FixedMain schedule runs multiple times
                         update_action_state::<A>,
@@ -156,8 +172,11 @@ impl<A: Actionlike + TypePath + bevy::reflect::GetTypeRegistration> Plugin
                 app.add_systems(FixedPostUpdate, release_on_input_map_removed::<A>);
                 app.add_systems(
                     FixedPostUpdate,
-                    tick_action_state::<A>
-                        .in_set(TickActionStateSystem::<A>::new())
+                    (
+                        apply_action_state_settings::<A>,
+                        tick_action_state::<A>.in_set(TickActionStateSystem::<A>::new()),
+                    )
+                        .chain()
                         .in_set(InputManagerSystem::Tick)
                         .before(InputManagerSystem::Update),
                 );
@@ -169,8 +188,11 @@ impl<A: Actionlike + TypePath + bevy::reflect::GetTypeRegistration> Plugin
             Machine::Server => {
                 app.add_systems(
                     PreUpdate,
-                    tick_action_state::<A>
-                        .in_set(TickActionStateSystem::<A>::new())
+                    (
+                        apply_action_state_settings::<A>,
+                        tick_action_state::<A>.in_set(TickActionStateSystem::<A>::new()),
+                    )
+                        .chain()
                         .in_set(InputManagerSystem::Tick),
                 );
             }
@@ -211,6 +233,7 @@ impl<A: Actionlike + TypePath + bevy::reflect::GetTypeRegistration> Plugin
         app.register_type::<ActionState<A>>()
             .register_type::<InputMap<A>>()
             .register_type::<ButtonData>()
+            .register_type::<InputContextPolicy>()
             .register_type::<ActionState<A>>()
             .register_type::<CentralInputStore>();
 
@@ -234,6 +257,21 @@ impl<A: Actionlike + TypePath + bevy::reflect::GetTypeRegistration> Plugin
 
         #[cfg(feature = "timing")]
         app.register_type::<Timing>();
+    }
+}
+
+#[derive(Resource)]
+pub(crate) struct InputManagerSettings<A: Actionlike> {
+    pub(crate) input_context_policy: InputContextPolicy,
+    _phantom: PhantomData<A>,
+}
+
+impl<A: Actionlike> InputManagerSettings<A> {
+    fn new(input_context_policy: InputContextPolicy) -> Self {
+        Self {
+            input_context_policy,
+            _phantom: PhantomData,
+        }
     }
 }
 

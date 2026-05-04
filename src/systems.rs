@@ -6,6 +6,7 @@ use bevy::log::debug;
 
 use crate::{
     Actionlike, action_state::ActionState, clashing_inputs::ClashStrategy, input_map::InputMap,
+    plugin::InputManagerSettings,
 };
 
 use bevy::ecs::prelude::*;
@@ -32,6 +33,21 @@ pub fn swap_to_update<A: Actionlike>(mut query: Query<&mut ActionState<A>>) {
 pub fn swap_to_fixed_update<A: Actionlike>(mut query: Query<&mut ActionState<A>>) {
     for mut action_state in query.iter_mut() {
         action_state.swap_to_fixed_update_state();
+    }
+}
+
+/// Advances actions timer.
+///
+/// Clears the just-pressed and just-released values of all [`ActionState`]s.
+/// Also resets the internal `pressed_this_tick` field, used to track whether to release an action.
+pub(crate) fn apply_action_state_settings<A: Actionlike>(
+    settings: Res<InputManagerSettings<A>>,
+    mut query: Query<&mut ActionState<A>>,
+) {
+    for mut action_state in query.iter_mut() {
+        if action_state.input_context_policy() != settings.input_context_policy {
+            action_state.set_input_context_policy(settings.input_context_policy);
+        }
     }
 }
 
@@ -67,14 +83,37 @@ pub fn update_action_state<A: Actionlike>(
     input_store: Res<CentralInputStore>,
     clash_strategy: Res<ClashStrategy>,
     mut gamepads: Query<Entity, With<Gamepad>>,
-    mut query: Query<(&mut ActionState<A>, &InputMap<A>)>,
+    is_added: Query<Entity, Added<InputMap<A>>>,
+    mut query: Query<(Entity, &mut ActionState<A>, &InputMap<A>)>,
 ) {
-    for (mut action_state, input_map) in query.iter_mut() {
+    for (entity, mut action_state, input_map) in query.iter_mut() {
         action_state.update(input_map.process_actions(
             Some(gamepads.reborrow()),
             &input_store,
             *clash_strategy,
         ));
+
+        if is_added.contains(entity)
+            && action_state.input_context_policy()
+                != crate::action_state::InputContextPolicy::Legacy
+        {
+            action_state.mark_as_fresh();
+        }
+    }
+
+    for (entity, mut action_state, input_map) in query.iter_mut() {
+        action_state.update(input_map.process_actions(
+            Some(gamepads.reborrow()),
+            &input_store,
+            *clash_strategy,
+        ));
+
+        if is_added.contains(entity)
+            && action_state.input_context_policy()
+                != crate::action_state::InputContextPolicy::Legacy
+        {
+            action_state.mark_as_fresh();
+        }
     }
 }
 

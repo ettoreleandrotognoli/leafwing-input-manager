@@ -30,7 +30,7 @@ pub use leafwing_input_manager_macros::Actionlike;
 pub mod prelude {
     pub use crate::InputControlKind;
 
-    pub use crate::action_state::ActionState;
+    pub use crate::action_state::{ActionState, InputContextPolicy};
     pub use crate::clashing_inputs::ClashStrategy;
     pub use crate::input_map::InputMap;
     pub use crate::input_processing::*;
